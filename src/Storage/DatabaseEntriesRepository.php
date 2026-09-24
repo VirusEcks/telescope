@@ -41,10 +41,10 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
      * Create a new database repository.
      *
      * @param  string  $connection
-     * @param  int  $chunkSize
+     * @param  int|null  $chunkSize
      * @return void
      */
-    public function __construct(string $connection, int $chunkSize = null)
+    public function __construct(string $connection, ?int $chunkSize = null)
     {
         $this->connection = $connection;
 
@@ -61,11 +61,15 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
      */
     public function find($id): EntryResult
     {
-        $entry = EntryModel::on($this->connection)->whereUuid($id)->firstOrFail();
-        $tags_table = config('telescope.storage.database.tags_table');
+        $entry = EntryModel::on($this->connection)
+                        ->when(strlen((string) $id) < 36 && ctype_xdigit((string) $id),
+                            fn ($query) => $query->where('uuid', 'like', $id.'%')->orderByDesc('sequence'),
+                            fn ($query) => $query->whereUuid($id))
+                        ->firstOrFail();
 
+        $tags_table = config('telescope.storage.database.tags_table');
         $tags = $this->table($tags_table)
-                        ->where('entry_uuid', $id)
+                        ->where('entry_uuid', $entry->uuid)
                         ->pluck('tag')
                         ->all();
 
@@ -129,7 +133,7 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
     /**
      * Store the given array of entries.
      *
-     * @param  \Illuminate\Support\Collection|\Laravel\Telescope\IncomingEntry[]  $entries
+     * @param  \Illuminate\Support\Collection<int, \Laravel\Telescope\IncomingEntry>  $entries
      * @return void
      */
     public function store(Collection $entries)
@@ -159,7 +163,7 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
     /**
      * Store the given array of exception entries.
      *
-     * @param  \Illuminate\Support\Collection|\Laravel\Telescope\IncomingEntry[]  $exceptions
+     * @param  \Illuminate\Support\Collection<int, \Laravel\Telescope\IncomingEntry>  $exceptions
      * @return void
      */
     protected function storeExceptions(Collection $exceptions)
@@ -173,13 +177,15 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
                 $this->table($entries_table)
                         ->where('type', EntryType::EXCEPTION)
                         ->where('family_hash', $exception->familyHash())
+                        ->where('should_display_on_index', true)
                         ->update(['should_display_on_index' => false]);
 
                 return array_merge($exception->toArray(), [
                     'family_hash' => $exception->familyHash(),
-                    'content' => json_encode(array_merge(
-                        $exception->content, ['occurrences' => $occurrences + 1]
-                    )),
+                    'content' => json_encode(
+                        array_merge($exception->content, ['occurrences' => $occurrences + 1]),
+                        JSON_INVALID_UTF8_SUBSTITUTE
+                    ),
                 ]);
             })->toArray());
         });
@@ -190,27 +196,45 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
     /**
      * Store the tags for the given entries.
      *
-     * @param  \Illuminate\Support\Collection  $results
+     * @param  \Illuminate\Support\Collection<string, array<array-key, mixed>>  $results
      * @return void
      */
     protected function storeTags(Collection $results)
     {
-        $tags_table = config('telescope.storage.database.tags_table');
+        $toInsert = [];
 
-        $results->chunk($this->chunkSize)->each(function ($chunked) use ($tags_table) {
-            try {
-                $this->table($tags_table)->insert($chunked->flatMap(function ($tags, $uuid) {
-                    return collect($tags)->map(function ($tag) use ($uuid) {
-                        return [
-                            'entry_uuid' => $uuid,
-                            'tag' => $tag,
-                        ];
-                    });
-                })->all());
-            } catch (UniqueConstraintViolationException $e) {
-                // Ignore tags that already exist...
+        foreach ($results as $uuid => $tags) {
+            foreach ($tags as $tag) {
+                $toInsert[] = [
+                    'entry_uuid' => $uuid,
+                    'tag' => $tag,
+                ];
+
+                if (count($toInsert) >= $this->chunkSize) {
+                    $this->insertChunkOfTags($toInsert);
+                    $toInsert = [];
+                }
             }
-        });
+        }
+
+        if ($toInsert !== []) {
+            $this->insertChunkOfTags($toInsert);
+        }
+    }
+
+    /**
+     * Insert a chunk of tags, ignoring unique constraint violations.
+     *
+     * @param  array<int, array{entry_uuid: string, tag: string}>  $tags
+     * @return void
+     */
+    protected function insertChunkOfTags($tags)
+    {
+        try {
+            $this->table('telescope_entries_tags')->insert($tags);
+        } catch (UniqueConstraintViolationException $e) {
+            // Ignore tags that already exist...
+        }
     }
 
     /**
@@ -371,9 +395,9 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
     public function prune(DateTimeInterface $before, $keepExceptions)
     {
         $entries_table = config('telescope.storage.database.table');
-
         $query = $this->table($entries_table)
-                ->where('created_at', '<', $before);
+                ->where('created_at', '<', $before)
+                ->orderBy('sequence');
 
         if ($keepExceptions) {
             $query->where('type', '!=', 'exception');
@@ -399,12 +423,12 @@ class DatabaseEntriesRepository implements Contract, ClearableRepository, Prunab
     {
         $entries_table = config('telescope.storage.database.table');
         do {
-            $deleted = $this->table($entries_table)->take($this->chunkSize)->delete();
+            $deleted = $this->table('telescope_entries')->orderBy('sequence')->take($this->chunkSize)->delete();
         } while ($deleted !== 0);
 
         $monitoring_table = config('telescope.storage.database.monitoring_table');
         do {
-            $deleted = $this->table($monitoring_table)->take($this->chunkSize)->delete();
+            $deleted = $this->table('telescope_monitoring')->orderBy('tag')->take($this->chunkSize)->delete();
         } while ($deleted !== 0);
     }
 

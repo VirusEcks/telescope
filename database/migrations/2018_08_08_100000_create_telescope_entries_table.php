@@ -48,7 +48,7 @@ return new class extends Migration
             $table->foreign('entry_uuid')
                 ->references('uuid')
                 ->on('telescope_entries')
-                ->onDelete('cascade');
+                ->cascadeOnDelete();
         });
 
         $schema->create(config('telescope.storage.database.monitoring_table'), function (Blueprint $table) {

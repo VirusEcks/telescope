@@ -9,11 +9,14 @@ use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\HtmlString;
+use Illuminate\Support\Js;
 use Illuminate\Support\Str;
 use Illuminate\Support\Testing\Fakes\EventFake;
 use Laravel\Telescope\Contracts\EntriesRepository;
 use Laravel\Telescope\Contracts\TerminableRepository;
 use Laravel\Telescope\Jobs\ProcessPendingUpdates;
+use RuntimeException;
 use Throwable;
 
 class Telescope
@@ -114,6 +117,13 @@ class Telescope
     public static $useDarkTheme = false;
 
     /**
+     * The CSP nonce to use for style and script tags.
+     *
+     * @var string
+     */
+    public static $nonceAttribute = '';
+
+    /**
      * Indicates if Telescope should record entries.
      *
      * @var bool
@@ -178,6 +188,8 @@ class Telescope
                 'horizon',
                 'horizon:work',
                 'horizon:supervisor',
+                'telescope:list',
+                'telescope:show',
             ], config('telescope.ignoreCommands', []), config('telescope.ignore_commands', []))
         );
     }
@@ -663,13 +675,15 @@ class Telescope
                 $updateResult = $storage->update(static::collectUpdates($batchId)) ?: Collection::make();
 
                 if (! isset($_ENV['VAPOR_SSM_PATH'])) {
+                    $delay = config('telescope.queue.delay');
+
                     $updateResult->whenNotEmpty(fn ($pendingUpdates) => rescue(fn () => ProcessPendingUpdates::dispatch(
                         $pendingUpdates,
                     )->onConnection(
                         config('telescope.queue.connection')
                     )->onQueue(
                         config('telescope.queue.queue')
-                    )->delay(now()->addSeconds(10))));
+                    )->delay(is_numeric($delay) && $delay > 0 ? now()->addSeconds($delay) : null)));
                 }
 
                 if ($storage instanceof TerminableRepository) {
@@ -804,6 +818,59 @@ class Telescope
     }
 
     /**
+     * Get the CSS for the Telescope dashboard.
+     *
+     * @return \Illuminate\Contracts\Support\Htmlable
+     */
+    public static function css()
+    {
+        if (($app = @file_get_contents(__DIR__.'/../dist/app.css')) === false) {
+            throw new RuntimeException('Unable to load the Telescope dashboard app CSS.');
+        }
+
+        $styles = match (static::$useDarkTheme) {
+            true => @file_get_contents(__DIR__.'/../dist/styles-dark.css'),
+            default => @file_get_contents(__DIR__.'/../dist/styles.css'),
+        };
+
+        if ($styles === false) {
+            throw new RuntimeException('Unable to load the '.(static::$useDarkTheme ? 'dark' : 'light').' Telescope dashboard styles.');
+        }
+
+        $nonceAttribute = static::$nonceAttribute;
+
+        return new HtmlString(<<<HTML
+            <style{$nonceAttribute}>{$app}</style>
+            <style{$nonceAttribute}>{$styles}</style>
+        HTML);
+    }
+
+    /**
+     * Get the JS for the Telescope dashboard.
+     *
+     * @return \Illuminate\Contracts\Support\Htmlable
+     */
+    public static function js()
+    {
+        if (($js = @file_get_contents(__DIR__.'/../dist/app.js')) === false) {
+            throw new RuntimeException('Unable to load the Telescope dashboard JavaScript.');
+        }
+
+        $js = str_replace(["\r\n", "\r"], "\n", $js);
+
+        $telescope = Js::from(static::scriptVariables());
+
+        $nonceAttribute = static::$nonceAttribute;
+
+        return new HtmlString(<<<HTML
+            <script type="module"{$nonceAttribute}>
+                window.Telescope = {$telescope};
+                {$js}
+            </script>
+            HTML);
+    }
+
+    /**
      * Get the default JavaScript variables for Telescope.
      *
      * @return array
@@ -815,5 +882,18 @@ class Telescope
             'timezone' => config('app.timezone'),
             'recording' => ! cache('telescope:pause-recording'),
         ];
+    }
+
+    /**
+     * Set the CSP nonce to use for style and script tags.
+     *
+     * @param  string  $nonce
+     * @return static
+     */
+    public static function cspNonce($nonce)
+    {
+        static::$nonceAttribute = ' nonce="'.htmlspecialchars($nonce, ENT_QUOTES, 'UTF-8').'"';
+
+        return new static;
     }
 }

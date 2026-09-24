@@ -3,6 +3,7 @@
 namespace Laravel\Telescope\Tests\Http;
 
 use Illuminate\Contracts\Auth\Authenticatable;
+use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
 use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Gate;
@@ -13,6 +14,8 @@ use Orchestra\Testbench\Http\Middleware\VerifyCsrfToken;
 
 class AuthorizationTest extends FeatureTestCase
 {
+    /** {@inheritdoc} */
+    #[\Override]
     protected function getPackageProviders($app)
     {
         return array_merge(
@@ -21,14 +24,19 @@ class AuthorizationTest extends FeatureTestCase
         );
     }
 
+    /** {@inheritdoc} */
+    #[\Override]
     protected function setUp(): void
     {
         parent::setUp();
 
         $this->withoutMiddleware([VerifyCsrfToken::class]);
         $this->withoutMiddleware([ValidateCsrfToken::class]);
+        $this->withoutMiddleware([PreventRequestForgery::class]);
     }
 
+    /** {@inheritdoc} */
+    #[\Override]
     protected function tearDown(): void
     {
         parent::tearDown();

@@ -38,12 +38,15 @@ class ClientRequestWatcher extends Watcher
             return;
         }
 
-        Telescope::recordClientRequest(IncomingEntry::make([
-            'method' => $event->request->method(),
-            'uri' => $event->request->url(),
-            'headers' => $this->headers($event->request->headers()),
-            'payload' => $this->payload($this->input($event->request)),
-        ]));
+        Telescope::recordClientRequest(
+            IncomingEntry::make([
+                'method' => $event->request->method(),
+                'uri' => $event->request->url(),
+                'headers' => $this->headers($event->request->headers()),
+                'payload' => $this->payload($this->input($event->request)),
+            ])
+            ->tags([$event->request->toPsrRequest()->getUri()->getHost()])
+        );
     }
 
     /**
@@ -54,20 +57,37 @@ class ClientRequestWatcher extends Watcher
      */
     public function recordResponse(ResponseReceived $event)
     {
-        if (! Telescope::isRecording()) {
+        if (! Telescope::isRecording() ||
+            $this->shouldIgnoreHost($event)) {
             return;
         }
 
-        Telescope::recordClientRequest(IncomingEntry::make([
-            'method' => $event->request->method(),
-            'uri' => $event->request->url(),
-            'headers' => $this->headers($event->request->headers()),
-            'payload' => $this->payload($this->input($event->request)),
-            'response_status' => $event->response->status(),
-            'response_headers' => $this->headers($event->response->headers()),
-            'response' => $this->response($event->response),
-            'duration' => $this->duration($event->response),
-        ]));
+        Telescope::recordClientRequest(
+            IncomingEntry::make([
+                'method' => $event->request->method(),
+                'uri' => $event->request->url(),
+                'headers' => $this->headers($event->request->headers()),
+                'payload' => $this->payload($this->input($event->request)),
+                'response_status' => $event->response->status(),
+                'response_headers' => $this->headers($event->response->headers()),
+                'response' => $this->response($event->response),
+                'duration' => $this->duration($event->response),
+            ])
+            ->tags([$event->request->toPsrRequest()->getUri()->getHost()])
+        );
+    }
+
+    /**
+     * Determine whether to ignore this request based on its host.
+     *
+     * @param  mixed  $event
+     * @return bool
+     */
+    protected function shouldIgnoreHost($event)
+    {
+        $host = $event->request->toPsrRequest()->getUri()->getHost();
+
+        return in_array($host, Arr::get($this->options, 'ignore_hosts', []));
     }
 
     /**
@@ -91,20 +111,22 @@ class ClientRequestWatcher extends Watcher
      */
     protected function response(Response $response)
     {
-        $content = $response->body();
-
         $stream = $response->toPsrResponse()->getBody();
 
-        if ($stream->isSeekable()) {
-            $stream->rewind();
+        if (! $stream->isSeekable()) {
+            return 'Stream Response';
         }
+
+        $content = $response->body();
+
+        $stream->rewind();
 
         if (is_string($content)) {
             if (is_array(json_decode($content, true)) &&
                 json_last_error() === JSON_ERROR_NONE) {
                 return $this->contentWithinLimits($content)
-                        ? $this->hideParameters(json_decode($content, true), Telescope::$hiddenResponseParameters)
-                        : 'Purged By Telescope';
+                    ? $this->hideParameters(json_decode($content, true), Telescope::$hiddenResponseParameters)
+                    : 'Purged By Telescope';
             }
 
             if (Str::startsWith(strtolower($response->header('Content-Type') ?? ''), 'text/plain')) {

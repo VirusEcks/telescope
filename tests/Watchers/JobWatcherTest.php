@@ -6,38 +6,31 @@ use Exception;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Foundation\Auth\User;
+use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Jobs\Job;
 use Illuminate\Queue\QueueManager;
-use Illuminate\Support\Facades\Schema;
+use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Str;
 use Laravel\Telescope\EntryType;
+use Laravel\Telescope\Telescope;
 use Laravel\Telescope\Tests\FeatureTestCase;
 use Laravel\Telescope\Watchers\JobWatcher;
+use Mockery as m;
+use Orchestra\Testbench\Attributes\WithConfig;
+use Orchestra\Testbench\Attributes\WithMigration;
+use Orchestra\Testbench\Factories\UserFactory;
 use Throwable;
 
+#[WithMigration('queue')]
+#[WithConfig('queue.failed.database', 'testbench')]
+#[WithConfig('logging.default', 'syslog')]
+#[WithConfig('telescope.watchers', [
+    JobWatcher::class => true,
+], defer: false)]
 class JobWatcherTest extends FeatureTestCase
 {
-    protected function getEnvironmentSetUp($app)
-    {
-        parent::getEnvironmentSetUp($app);
-
-        $app->get('config')->set('telescope.watchers', [
-            JobWatcher::class => true,
-        ]);
-
-        $app->get('config')->set('queue.failed.database', 'testbench');
-
-        $app->get('config')->set('logging.default', 'syslog');
-    }
-
-    protected function setUp(): void
-    {
-        parent::setUp();
-
-        $this->createJobsTable();
-    }
-
     public function test_job_registers_entry()
     {
         $this->app->get(Dispatcher::class)->dispatch(new MyDatabaseJob('Awesome Laravel'));
@@ -104,6 +97,49 @@ class JobWatcherTest extends FeatureTestCase
         $this->assertSame('handle', $entry->content['exception']['trace'][0]['function']);
     }
 
+    public function test_processed_job_clears_stale_failure_state_left_by_a_duplicate_reservation()
+    {
+        // A long-running job whose runtime exceeds the queue's retry_after can be
+        // reserved twice: a second worker fails it with MaxAttemptsExceededException
+        // (JobFailed) while the original worker eventually completes it (JobProcessed).
+        // Both events target the same telescope_uuid, so the processed update must not
+        // leave behind the failure's exception payload or "failed" tag.
+        Telescope::startRecording(false);
+
+        $watcher = new JobWatcher;
+
+        $entry = $watcher->recordJob('redis', 'default', [
+            'job' => 'Illuminate\Queue\CallQueuedHandler@call',
+            'displayName' => MyDatabaseJob::class,
+            'maxTries' => 1,
+            'timeout' => 30,
+            'data' => ['payload' => 'long-running'],
+        ]);
+
+        $job = m::mock(Job::class);
+        $job->shouldReceive('payload')->andReturn(['telescope_uuid' => $entry->uuid]);
+
+        $watcher->recordFailedJob(new JobFailed(
+            'redis', $job, new Exception(MyDatabaseJob::class.' has been attempted too many times.')
+        ));
+
+        $watcher->recordProcessedJob(new JobProcessed('redis', $job));
+
+        $stored = $this->loadTelescopeEntries()->first();
+
+        $this->assertSame(EntryType::JOB, $stored->type);
+        $this->assertSame('processed', $stored->content['status']);
+        $this->assertNull($stored->content['exception']);
+
+        $hasFailedTag = $this->app['db']->connection('testbench')
+            ->table('telescope_entries_tags')
+            ->where('entry_uuid', $entry->uuid)
+            ->where('tag', 'failed')
+            ->exists();
+
+        $this->assertFalse($hasFailedTag, 'The "failed" tag must be removed once the job is processed.');
+    }
+
     public function test_it_handles_pushed_jobs()
     {
         $queueExceptions = [];
@@ -130,31 +166,28 @@ class JobWatcherTest extends FeatureTestCase
         $this->assertSame(['framework' => 'Laravel'], $entry->content['data']);
     }
 
-    private function createJobsTable(): void
+    public function test_job_can_handle_deleted_serialized_model()
     {
-        if (! Schema::hasTable('jobs')) {
-            Schema::create('jobs', function (Blueprint $table) {
-                $table->bigIncrements('id');
-                $table->string('queue')->index();
-                $table->longText('payload');
-                $table->unsignedTinyInteger('attempts');
-                $table->unsignedInteger('reserved_at')->nullable();
-                $table->unsignedInteger('available_at');
-                $table->unsignedInteger('created_at');
-            });
-        }
+        $user = UserFactory::new()->create();
 
-        if (! Schema::hasTable('failed_jobs')) {
-            Schema::create('failed_jobs', function (Blueprint $table) {
-                $table->uuid('uuid');
-                $table->bigIncrements('id');
-                $table->text('connection');
-                $table->text('queue');
-                $table->longText('payload');
-                $table->longText('exception');
-                $table->timestamp('failed_at')->useCurrent();
-            });
-        }
+        $this->app->get(Dispatcher::class)->dispatch(
+            new MockedDeleteUserJob($user)
+        );
+
+        $this->artisan('queue:work', [
+            'connection' => 'database',
+            '--once' => true,
+        ])->run();
+
+        $entry = $this->loadTelescopeEntries()->first();
+
+        $this->assertSame(EntryType::JOB, $entry->type);
+        $this->assertSame('processed', $entry->content['status']);
+        $this->assertSame('database', $entry->content['connection']);
+        $this->assertSame(MockedDeleteUserJob::class, $entry->content['name']);
+        $this->assertSame('default', $entry->content['queue']);
+
+        $this->assertSame(sprintf('%s:%s', get_class($user), $user->getKey()), $entry->content['data']['user']);
     }
 }
 
@@ -174,6 +207,27 @@ class MockedBatchableJob implements ShouldQueue
     public function handle()
     {
         //
+    }
+}
+
+class MockedDeleteUserJob implements ShouldQueue
+{
+    use SerializesModels;
+
+    public $connection = 'database';
+
+    public $deleteWhenMissingModels = true;
+
+    public $user;
+
+    public function __construct(User $user)
+    {
+        $this->user = $user;
+    }
+
+    public function handle()
+    {
+        $this->user->delete();
     }
 }
 

@@ -2,6 +2,7 @@
 
 namespace Laravel\Telescope\Tests\Http;
 
+use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
 use Illuminate\Foundation\Http\Middleware\ValidateCsrfToken;
 use Illuminate\Testing\TestResponse;
 use Laravel\Telescope\Database\Factories\EntryModelFactory;
@@ -10,14 +11,17 @@ use Laravel\Telescope\Http\Middleware\Authorize;
 use Laravel\Telescope\Tests\FeatureTestCase;
 use Orchestra\Testbench\Http\Middleware\VerifyCsrfToken;
 use PHPUnit\Framework\Assert as PHPUnit;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class RouteTest extends FeatureTestCase
 {
+    /** {@inheritdoc} */
+    #[\Override]
     protected function setUp(): void
     {
         parent::setUp();
 
-        $this->withoutMiddleware([Authorize::class, VerifyCsrfToken::class, ValidateCsrfToken::class]);
+        $this->withoutMiddleware([Authorize::class, VerifyCsrfToken::class, ValidateCsrfToken::class, PreventRequestForgery::class]);
 
         $this->registerAssertJsonExactFragmentMacro();
     }
@@ -46,7 +50,8 @@ class RouteTest extends FeatureTestCase
     /**
      * @dataProvider telescopeIndexRoutesProvider
      */
-    public function test_route($endpoint)
+    #[DataProvider('telescopeIndexRoutesProvider')]
+    public function test_route($endpoint, $entryType)
     {
         $this->post($endpoint)
             ->assertSuccessful()
@@ -56,6 +61,7 @@ class RouteTest extends FeatureTestCase
     /**
      * @dataProvider telescopeIndexRoutesProvider
      */
+    #[DataProvider('telescopeIndexRoutesProvider')]
     public function test_simple_list_of_entries($endpoint, $entryType)
     {
         $entry = EntryModelFactory::new()->create(['type' => $entryType]);

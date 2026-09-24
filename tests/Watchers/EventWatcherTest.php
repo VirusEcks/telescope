@@ -5,29 +5,27 @@ namespace Laravel\Telescope\Tests\Watchers;
 use Dummies\DummyEvent;
 use Dummies\DummyEventListener;
 use Dummies\DummyEventSubscriber;
+use Dummies\DummyEventWithObject;
 use Dummies\DummyInvokableEventListener;
+use Dummies\DummyObject;
 use Dummies\IgnoredEvent;
 use Illuminate\Support\Facades\Event;
 use Laravel\Telescope\EntryType;
 use Laravel\Telescope\Tests\FeatureTestCase;
 use Laravel\Telescope\Watchers\EventWatcher;
+use Orchestra\Testbench\Attributes\WithConfig;
+use PHPUnit\Framework\Attributes\DataProvider;
 
+#[WithConfig('telescope.watchers', [
+    EventWatcher::class => [
+        'enabled' => true,
+        'ignore' => [
+            IgnoredEvent::class,
+        ],
+    ],
+], defer: false)]
 class EventWatcherTest extends FeatureTestCase
 {
-    protected function getEnvironmentSetUp($app)
-    {
-        parent::getEnvironmentSetUp($app);
-
-        $app->get('config')->set('telescope.watchers', [
-            EventWatcher::class => [
-                'enabled' => true,
-                'ignore' => [
-                    IgnoredEvent::class,
-                ],
-            ],
-        ]);
-    }
-
     public function test_event_watcher_registers_any_events()
     {
         Event::listen(DummyEvent::class, function ($payload) {
@@ -58,6 +56,25 @@ class EventWatcherTest extends FeatureTestCase
         $this->assertContains('Telescope', $entry->content['payload']['data']);
         $this->assertContains('Laravel', $entry->content['payload']['data']);
         $this->assertContains('PHP', $entry->content['payload']['data']);
+    }
+
+    public function test_event_watcher_with_object_property_calls_format_for_telescope_method_if_it_exists()
+    {
+        Event::listen(DummyEventWithObject::class, function ($payload) {
+            //
+        });
+
+        event(new DummyEventWithObject());
+
+        $entry = $this->loadTelescopeEntries()->first();
+
+        $this->assertSame(EntryType::EVENT, $entry->type);
+        $this->assertSame(DummyEventWithObject::class, $entry->content['name']);
+        $this->assertArrayHasKey('thing', $entry->content['payload']);
+        $this->assertSame(DummyObject::class, $entry->content['payload']['thing']['class']);
+        $this->assertContains('Telescope', $entry->content['payload']['thing']['properties']);
+        $this->assertContains('Laravel', $entry->content['payload']['thing']['properties']);
+        $this->assertContains('PHP', $entry->content['payload']['thing']['properties']);
     }
 
     public function test_event_watcher_registers_events_and_stores_payloads_with_subscriber_methods()
@@ -104,12 +121,16 @@ class EventWatcherTest extends FeatureTestCase
     /**
      * @dataProvider formatListenersProvider
      */
+    #[DataProvider('formatListenersProvider')]
     public function test_format_listeners($listener, $formatted)
     {
         Event::listen(DummyEvent::class, $listener);
 
         $method = new \ReflectionMethod(EventWatcher::class, 'formatListeners');
-        $method->setAccessible(true);
+
+        if (PHP_VERSION_ID < 80500) {
+            $method->setAccessible(true);
+        }
 
         $this->assertSame($formatted, $method->invoke(new EventWatcher, DummyEvent::class)[0]['name']);
     }
@@ -171,6 +192,26 @@ class DummyEvent
     public function handle()
     {
         //
+    }
+}
+
+class DummyEventWithObject
+{
+    public $thing;
+
+    public function __construct()
+    {
+        $this->thing = new DummyObject;
+    }
+}
+
+class DummyObject
+{
+    public function formatForTelescope(): array
+    {
+        return [
+            'Telescope', 'Laravel', 'PHP',
+        ];
     }
 }
 

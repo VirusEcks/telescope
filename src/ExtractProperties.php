@@ -19,7 +19,9 @@ class ExtractProperties
     {
         return collect((new ReflectionClass($target))->getProperties())
             ->mapWithKeys(function ($property) use ($target) {
-                $property->setAccessible(true);
+                if (PHP_VERSION_ID < 80500) {
+                    $property->setAccessible(true);
+                }
 
                 if (PHP_VERSION_ID >= 70400 && ! $property->isInitialized($target)) {
                     return [];
@@ -31,7 +33,9 @@ class ExtractProperties
                     return [
                         $property->getName() => [
                             'class' => get_class($value),
-                            'properties' => json_decode(json_encode($value), true),
+                            'properties' => method_exists($value, 'formatForTelescope')
+                                ? $value->formatForTelescope()
+                                : json_decode(json_encode($value), true),
                         ],
                     ];
                 } else {
